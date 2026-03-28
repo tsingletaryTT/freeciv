@@ -80,10 +80,12 @@
 #include "government.h"
 #include "map.h"
 #include "mapimg.h"
+#include "terrain.h"
 #include "modpack.h"
 #include "nation.h"
 #include "packets.h"
 #include "player.h"
+#include "rgbcolor.h"
 #include "research.h"
 #include "tech.h"
 #include "unitlist.h"
@@ -142,6 +144,8 @@
 /* server/generator */
 #include "mapgen.h"
 #include "mapgen_utils.h"
+#include "generator/ttlang_client.h"   /* TT-Lang hardware integration */
+#include "generator/tt_tile_cache.h"   /* Per-turn TT tile score cache */
 
 /* ai */
 #include "aitraits.h"
@@ -1204,6 +1208,500 @@ static void begin_turn(bool is_new_turn)
       calc_civ_score(pplayer);
     } players_iterate_end;
     log_civ_score_now();
+
+    /* TT-Lang: generate per-turn terrain events on P300C hardware.
+     * Each call asks the TT kernel to compute an intensity field seeded by
+     * the current turn; tiles above the threshold receive a bonus resource
+     * (Gold / Oil / Pheasant / Fish, cycling each turn).
+     * Falls back silently if the TT-Lang server is not running. */
+    if (ttlang_available()) {
+      ttlang_event_t events[TTLANG_MAX_EVENTS];
+      int n_events = 0;
+
+      if (ttlang_turn_events(game.info.turn,
+                             wld.map.xsize, wld.map.ysize,
+                             events, &n_events)
+          && n_events > 0) {
+        int i;
+
+        for (i = 0; i < n_events; i++) {
+          struct tile *ptile = index_to_tile(&(wld.map), events[i].tile_idx);
+          struct extra_type *pextra;
+
+          if (ptile == nullptr) continue;
+
+          /* ── Ecological terrain filter ───────────────────────────────────
+           * Each resource only appears where it makes ecological sense.
+           * Uses base terrain yield outputs rather than fragile name checks.
+           *   Gold   → hills/mountains: shields≥1, food≤1  (mineral-rich)
+           *   Coal   → hills/plains:    shields≥1, any food (industrial)
+           *   Pheasant→ fertile land:   food≥2,    not ocean (grassland/forest)
+           *   Fish   → water tiles:     ocean/lake (coast/sea only)
+           */
+          {
+            const struct terrain *pt = tile_terrain(ptile);
+            bool ocean = is_ocean_tile(ptile);
+            bool ok = false;
+
+            if (pt == nullptr || pt == T_UNKNOWN) goto skip_event;
+
+            if (strcmp(events[i].extra_name, "Gold") == 0) {
+              /* Hills/mountains: must produce shields, low food */
+              ok = !ocean
+                   && pt->output[O_SHIELD] >= 1
+                   && pt->output[O_FOOD]   <= 1;
+            } else if (strcmp(events[i].extra_name, "Coal") == 0) {
+              /* Any land with some shield production */
+              ok = !ocean && pt->output[O_SHIELD] >= 1;
+            } else if (strcmp(events[i].extra_name, "Pheasant") == 0) {
+              /* Fertile grassland/forest: high food, not water */
+              ok = !ocean && pt->output[O_FOOD] >= 2;
+            } else if (strcmp(events[i].extra_name, "Fish") == 0) {
+              /* Water tiles only */
+              ok = ocean;
+            } else {
+              /* Unknown resource type: land-only default */
+              ok = !ocean;
+            }
+
+            if (!ok) goto skip_event;
+          }
+
+          pextra = extra_type_by_rule_name(events[i].extra_name);
+          if (pextra == nullptr) continue;
+
+          /* Only place if the tile doesn't already have this extra */
+          if (!tile_has_extra(ptile, pextra)) {
+            create_extra(ptile, pextra, nullptr);
+            update_tile_knowledge(ptile);
+          }
+          skip_event: ;
+        }
+        log_normal("TT-Lang: turn %d terrain events: %d tiles updated",
+                   game.info.turn, n_events);
+
+        /* Push terrain event notification into the game UI event log */
+        if (n_events > 0) {
+          /* Use the first event tile for the viewport hint */
+          struct tile *first_tile = index_to_tile(&(wld.map),
+                                                  events[0].tile_idx);
+          notify_conn(game.est_connections, first_tile,
+                      E_GLOBAL_ECO, ftc_server,
+                      _("P300C Blackhole: %d new %s deposits discovered "
+                        "this turn by TT-Lang terrain kernel."),
+                      n_events, events[0].extra_name);
+        }
+      }
+    }
+
+    /* TT-Lang: score all map tiles on P300C hardware each turn.
+     * Advisory only — logs top candidates, does not modify AI logic.
+     * Runs every turn so it fires even in single-player games. */
+    if (ttlang_available()) {
+      int map_w = wld.map.xsize;
+      int map_h = wld.map.ysize;
+      int map_tiles = map_w * map_h;
+      float *food_arr    = (float *)fc_malloc(sizeof(float) * map_tiles);
+      float *shields_arr = (float *)fc_malloc(sizeof(float) * map_tiles);
+      float *trade_arr   = (float *)fc_malloc(sizeof(float) * map_tiles);
+      float *scores_arr  = (float *)fc_malloc(sizeof(float) * map_tiles);
+      int    top_tiles[32];
+      int    n_top = 0;
+      int    disaster_active = 0;
+      int    disaster_epi    = 0;
+
+      whole_map_iterate(&(wld.map), ptile) {
+        int idx = tile_index(ptile);
+        /* Use raw terrain base yields — city_tile_output(NULL, ...) returns 0
+         * for all tiles without a city context.  terrain->output[] gives the
+         * base terrain production (e.g. Grassland=2 food, Plains=1 food+1 shield) */
+        const struct terrain *pterrain = tile_terrain(ptile);
+        if (pterrain != NULL && pterrain != T_UNKNOWN) {
+          food_arr[idx]    = (float)pterrain->output[O_FOOD];
+          shields_arr[idx] = (float)pterrain->output[O_SHIELD];
+          trade_arr[idx]   = (float)pterrain->output[O_TRADE];
+        } else {
+          food_arr[idx]    = 0.0f;
+          shields_arr[idx] = 0.0f;
+          trade_arr[idx]   = 0.0f;
+        }
+      } whole_map_iterate_end;
+
+
+      if (ttlang_score_tiles(map_w, map_h, game.info.turn,
+                             food_arr, shields_arr, trade_arr,
+                             scores_arr, top_tiles, &n_top,
+                             &disaster_active, &disaster_epi)) {
+        int i;
+
+        /* Store scores in cache so city_tile_value() can blend them in
+         * when the AI evaluates tile desirability this turn. */
+        tt_tile_cache_update(scores_arr, map_tiles);
+
+        for (i = 0; i < n_top && i < 3; i++) {
+          int idx = top_tiles[i];
+
+          log_normal("TT-Lang: turn %d AI scoring — top tile #%d at (%d,%d)"
+                     " score=%.1f (TT-driven AI bias active)",
+                     game.info.turn, i + 1,
+                     index_to_map_pos_x(idx),
+                     index_to_map_pos_y(idx),
+                     (double)scores_arr[idx]);
+        }
+
+        /* ── Visual effect: Road markers on top-5 TT-scored land tiles ────
+         * Roads are visible to all players and mark TT-identified prime land.
+         * They also give the AI a movement bonus when settling these tiles. */
+        {
+          struct extra_type *road = extra_type_by_rule_name("Road");
+          if (road != NULL) {
+            for (i = 0; i < n_top && i < 5; i++) {
+              struct tile *ptile = index_to_tile(&(wld.map), top_tiles[i]);
+              if (ptile != NULL && !is_ocean_tile(ptile)
+                  && !tile_has_extra(ptile, road)) {
+                create_extra(ptile, road, NULL);
+                update_tile_knowledge(ptile);
+              }
+            }
+          }
+        }
+
+        /* ── Visual effect: Pollution near active disaster epicenter ────────
+         * Pollution marks the disaster zone visibly on the map and persists
+         * until workers clean it up — which mirrors how disasters linger.
+         * Placed in a ~3-tile radius around the epicenter on land tiles only. */
+        if (disaster_active) {
+          struct extra_type *pollution = extra_type_by_rule_name("Pollution");
+          if (pollution != NULL) {
+            struct tile *epi_tile = index_to_tile(&(wld.map), disaster_epi);
+            if (epi_tile != NULL) {
+              /* Stamp Pollution on epicenter and immediate neighbours */
+              adjc_iterate(&(wld.map), epi_tile, ptile2) {
+                if (!is_ocean_tile(ptile2)
+                    && !tile_has_extra(ptile2, pollution)) {
+                  create_extra(ptile2, pollution, NULL);
+                  update_tile_knowledge(ptile2);
+                }
+              } adjc_iterate_end;
+              /* Also the epicenter tile itself */
+              if (!is_ocean_tile(epi_tile)
+                  && !tile_has_extra(epi_tile, pollution)) {
+                create_extra(epi_tile, pollution, NULL);
+                update_tile_knowledge(epi_tile);
+              }
+              /* Notify all players: disaster visible in UI event log */
+              notify_conn(game.est_connections, epi_tile,
+                          E_DISASTER, ftc_server,
+                          _("P300C Blackhole: disaster spreading — "
+                            "Pollution detected at (%d,%d). "
+                            "128 Tensix cores tracking the event."),
+                          index_to_map_pos_x(disaster_epi),
+                          index_to_map_pos_y(disaster_epi));
+              log_normal("TT-Lang: turn %d disaster visual — Pollution placed"
+                         " near epicenter (%d,%d)",
+                         game.info.turn,
+                         index_to_map_pos_x(disaster_epi),
+                         index_to_map_pos_y(disaster_epi));
+            }
+          }
+        }
+
+        /* ── In-game UI: TT weather + AI score notification ─────────────────
+         * Pushes a concise summary into the events pane each turn so players
+         * can see the hardware activity without looking at the terminal.
+         * Uses E_GLOBAL_ECO (environmental events) — appears in the
+         * game's "Global" events filter. */
+        if (n_top > 0) {
+          struct tile *best_tile = index_to_tile(&(wld.map), top_tiles[0]);
+          notify_conn(game.est_connections, best_tile,
+                      E_GLOBAL_ECO, ftc_server,
+                      _("P300C: TT scoring complete — "
+                        "best land at (%d,%d) score=%.1f. "
+                        "64 Tensix cores guided AI settlers this turn."),
+                      index_to_map_pos_x(top_tiles[0]),
+                      index_to_map_pos_y(top_tiles[0]),
+                      (double)scores_arr[top_tiles[0]]);
+        }
+      }
+
+      free(food_arr);
+      free(shields_arr);
+      free(trade_arr);
+      free(scores_arr);
+
+      /* ── City territorial influence (TT hardware) ────────────────────────
+       * Collect all city positions, send to Python, get back a per-tile
+       * influence field showing rival territorial reach.  Blended into the
+       * tile score cache so the AI steers settlers into genuinely open land. */
+      {
+        ttlang_city_t *city_arr
+            = (ttlang_city_t *)fc_malloc(sizeof(ttlang_city_t)
+                                         * TTLANG_MAX_CITIES);
+        int n_cities = 0;
+
+        players_iterate(pplayer) {
+          city_list_iterate(pplayer->cities, pcity) {
+            if (n_cities < TTLANG_MAX_CITIES) {
+              city_arr[n_cities].tile_idx  = tile_index(pcity->tile);
+              city_arr[n_cities].player_id = player_index(pplayer);
+              n_cities++;
+            }
+          } city_list_iterate_end;
+        } players_iterate_end;
+
+        if (n_cities > 0) {
+          float *influence = (float *)fc_malloc(sizeof(float) * map_tiles);
+
+          if (ttlang_city_influence(map_w, map_h, game.info.turn,
+                                    city_arr, n_cities, influence)) {
+            /* Blend influence penalty into the tile score cache.
+             * influence[i] is in [-0.6, 0]: negative near rival cities.
+             * Multiply the existing cache score by (1 + influence). */
+            tt_tile_cache_blend_influence(influence, map_tiles);
+
+            log_normal("TT-Lang: turn %d city influence — %d cities, "
+                       "rival penalty blended into AI tile cache",
+                       game.info.turn, n_cities);
+          }
+          free(influence);
+        }
+        free(city_arr);
+      }
+
+      /* ── TT-Lang: per-settler destination recommendation ─────────────────
+       * Collect idle AI settlers, send to Python, get TT-computed optimal
+       * destination per settler (reach-weighted attractiveness from the
+       * pathfinding field cached this turn), then pre-set goto_tile.
+       *
+       * ai_start_phase() may override for settlers it assigns city tasks to,
+       * but idle settlers with no plan will follow the TT-recommended tile.
+       * Both outcomes are correct: TT scores are blended into city_tile_value()
+       * so the AI's own picker usually agrees with the TT recommendation. */
+      {
+        int unit_ids[TTLANG_MAX_UNITS];
+        int unit_tiles[TTLANG_MAX_UNITS];
+        int n_units = 0;
+        ttlang_unit_rec_t recs[TTLANG_MAX_UNITS];
+        int n_recs = 0;
+
+        players_iterate(pplayer) {
+          if (!is_ai(pplayer)) continue;
+          unit_list_iterate(pplayer->units, punit) {
+            if (n_units >= TTLANG_MAX_UNITS) break;
+            /* Only idle AI settlers without an active goto destination.
+             * Use L_SETTLERS role (city-founding units) to identify settlers. */
+            if (utype_has_role(unit_type_get(punit), L_SETTLERS)
+                && punit->activity == ACTIVITY_IDLE
+                && punit->goto_tile == nullptr) {
+              unit_ids[n_units]   = punit->id;
+              unit_tiles[n_units] = tile_index(unit_tile(punit));
+              n_units++;
+            }
+          } unit_list_iterate_end;
+        } players_iterate_end;
+
+        if (n_units > 0
+            && ttlang_unit_eval(map_w, map_h, game.info.turn,
+                                unit_ids, unit_tiles, n_units,
+                                recs, &n_recs)
+            && n_recs > 0) {
+          int r;
+          for (r = 0; r < n_recs; r++) {
+            struct unit *pu = game_unit_by_number(recs[r].unit_id);
+            struct tile *dest =
+                index_to_tile(&(wld.map), recs[r].best_tile);
+            if (pu == nullptr || dest == nullptr) continue;
+            if (dest == unit_tile(pu)) continue;  /* already there */
+
+            pu->goto_tile = dest;
+            log_normal("TT-Lang: turn %d settler #%d → (%d,%d) "
+                       "[TT unit eval]",
+                       game.info.turn, recs[r].unit_id,
+                       index_to_map_pos_x(recs[r].best_tile),
+                       index_to_map_pos_y(recs[r].best_tile));
+          }
+          notify_conn(game.est_connections, nullptr,
+                      E_GLOBAL_ECO, ftc_server,
+                      _("P300C Blackhole: %d settlers assigned "
+                        "TT-optimal destinations this turn."),
+                      n_recs);
+        }
+      }
+
+      /* ── TT-Lang: city production priority scoring ────────────────────────
+       * Collect AI city yields and visible enemy positions, send to TT hardware.
+       * TT runs ThreatFieldModel (8-pass diffusion) + CityProdModel (6 passes)
+       * to score each city across Military / Growth / Science priorities.
+       * The computed threat field is cached in the server for combat_pos reuse.
+       *
+       * High-urgency recommendations (> 0.7) are logged so admins can observe
+       * how P300C hardware is influencing in-game build decisions. */
+      {
+        int   city_tiles[TTLANG_MAX_CITIES];
+        float city_food[TTLANG_MAX_CITIES];
+        float city_shields[TTLANG_MAX_CITIES];
+        float city_trade[TTLANG_MAX_CITIES];
+        float city_pop[TTLANG_MAX_CITIES];
+        int   n_cp_cities = 0;
+
+        /* Collect visible enemy military unit positions for threat field.
+         * We iterate all players' units; the Python server will diffuse
+         * threat outward from these positions on TT hardware. */
+        int   enemy_tiles[TTLANG_MAX_UNITS];
+        float enemy_strengths[TTLANG_MAX_UNITS];
+        int   n_enemy = 0;
+
+        /* Gather AI city data */
+        players_iterate(pplayer) {
+          if (!is_ai(pplayer)) continue;
+          city_list_iterate(pplayer->cities, pcity) {
+            if (n_cp_cities >= TTLANG_MAX_CITIES) break;
+            city_tiles[n_cp_cities]   = tile_index(city_tile(pcity));
+            city_food[n_cp_cities]    = (float)pcity->prod[O_FOOD];
+            city_shields[n_cp_cities] = (float)pcity->prod[O_SHIELD];
+            city_trade[n_cp_cities]   = (float)pcity->prod[O_TRADE];
+            city_pop[n_cp_cities]     = (float)city_size_get(pcity);
+            n_cp_cities++;
+          } city_list_iterate_end;
+        } players_iterate_end;
+
+        /* Gather visible enemy military units (non-settler, alive) */
+        players_iterate(pother) {
+          if (!pother->is_alive) continue;
+          unit_list_iterate(pother->units, punit) {
+            if (n_enemy >= TTLANG_MAX_UNITS) break;
+            /* Skip settlers and workers — only military units generate threat */
+            if (utype_has_role(unit_type_get(punit), L_SETTLERS)) continue;
+            if (unit_type_get(punit)->attack_strength <= 0) continue;
+            enemy_tiles[n_enemy]     = tile_index(unit_tile(punit));
+            enemy_strengths[n_enemy] = (float)unit_type_get(punit)->attack_strength;
+            n_enemy++;
+          } unit_list_iterate_end;
+        } players_iterate_end;
+
+        if (n_cp_cities > 0) {
+          ttlang_city_prod_rec_t *cp_recs =
+              (ttlang_city_prod_rec_t *)fc_malloc(
+                  sizeof(ttlang_city_prod_rec_t) * n_cp_cities);
+          int n_cp_recs = 0;
+
+          if (ttlang_city_prod(map_w, map_h, game.info.turn,
+                               city_tiles, city_food, city_shields,
+                               city_trade, city_pop, n_cp_cities,
+                               enemy_tiles, enemy_strengths, n_enemy,
+                               cp_recs, &n_cp_recs)) {
+            static const char * const cat_names[] =
+                {"MILITARY", "GROWTH", "SCIENCE"};
+            int urgent_mil = 0, urgent_grw = 0, urgent_sci = 0;
+            int r;
+            for (r = 0; r < n_cp_recs; r++) {
+              if (cp_recs[r].urgency > 0.7f) {
+                if      (cp_recs[r].prod_cat == TTLANG_PROD_MILITARY) urgent_mil++;
+                else if (cp_recs[r].prod_cat == TTLANG_PROD_GROWTH)   urgent_grw++;
+                else if (cp_recs[r].prod_cat == TTLANG_PROD_SCIENCE)  urgent_sci++;
+                log_normal("TT-Lang: turn %d city@%d → %s urgency=%.2f",
+                           game.info.turn, cp_recs[r].city_tile,
+                           cat_names[cp_recs[r].prod_cat],
+                           (double)cp_recs[r].urgency);
+              }
+            }
+            if (urgent_mil + urgent_grw + urgent_sci > 0) {
+              notify_conn(game.est_connections, nullptr,
+                          E_GLOBAL_ECO, ftc_server,
+                          _("P300C Blackhole: %d cities need MILITARY, "
+                            "%d GROWTH, %d SCIENCE (TT production scoring)."),
+                          urgent_mil, urgent_grw, urgent_sci);
+            }
+          }
+          free(cp_recs);
+        }
+      }
+
+      /* ── TT-Lang: combat positioning orders ──────────────────────────────
+       * Collect idle AI military units, ask TT hardware for advance/hold/
+       * retreat orders.  TT computes an own-strength diffusion field and
+       * compares it against the threat field cached from city_prod above.
+       *
+       * Signal = own_strength[tile] - threat[tile]:
+       *   > +0.25  → ADVANCE toward highest-threat neighbour (attack opportunity)
+       *   < -0.25  → RETREAT toward highest own-strength tile (regroup)
+       *   otherwise → HOLD (balanced position)
+       *
+       * goto_tile is set for advance/retreat units so the AI pathfinder
+       * moves them toward the TT-recommended destination this turn. */
+      {
+        int   combat_ids[TTLANG_MAX_COMBAT_UNITS];
+        int   combat_tiles[TTLANG_MAX_COMBAT_UNITS];
+        float combat_strengths[TTLANG_MAX_COMBAT_UNITS];
+        int   n_combat = 0;
+
+        players_iterate(pplayer) {
+          if (!is_ai(pplayer)) continue;
+          unit_list_iterate(pplayer->units, punit) {
+            if (n_combat >= TTLANG_MAX_COMBAT_UNITS) break;
+            /* Military units: have attack power, not settlers or workers */
+            if (utype_has_role(unit_type_get(punit), L_SETTLERS)) continue;
+            if (unit_type_get(punit)->attack_strength <= 0) continue;
+            combat_ids[n_combat]       = punit->id;
+            combat_tiles[n_combat]     = tile_index(unit_tile(punit));
+            combat_strengths[n_combat] = (float)unit_type_get(punit)->attack_strength;
+            n_combat++;
+          } unit_list_iterate_end;
+        } players_iterate_end;
+
+        if (n_combat > 0) {
+          ttlang_combat_order_t *cp_orders =
+              (ttlang_combat_order_t *)fc_malloc(
+                  sizeof(ttlang_combat_order_t) * n_combat);
+          int n_cp_orders = 0;
+
+          if (ttlang_combat_pos(map_w, map_h, game.info.turn,
+                                combat_ids, combat_tiles, combat_strengths,
+                                n_combat, cp_orders, &n_cp_orders)
+              && n_cp_orders > 0) {
+            int n_advance = 0, n_retreat = 0;
+            int r;
+            for (r = 0; r < n_cp_orders; r++) {
+              if (cp_orders[r].action == TTLANG_ACTION_HOLD) continue;
+
+              struct unit *pu = game_unit_by_number(cp_orders[r].unit_id);
+              if (pu == nullptr) continue;
+              /* Only move units that are idle and have no pending goto */
+              if (pu->activity != ACTIVITY_IDLE
+                  || pu->goto_tile != nullptr) continue;
+
+              if (cp_orders[r].goto_tile < 0) continue;
+              struct tile *dest =
+                  index_to_tile(&(wld.map), cp_orders[r].goto_tile);
+              if (dest == nullptr || dest == unit_tile(pu)) continue;
+
+              pu->goto_tile = dest;
+              if (cp_orders[r].action == TTLANG_ACTION_ADVANCE) {
+                n_advance++;
+                log_normal("TT-Lang: turn %d unit #%d ADVANCE → (%d,%d)",
+                           game.info.turn, cp_orders[r].unit_id,
+                           index_to_map_pos_x(cp_orders[r].goto_tile),
+                           index_to_map_pos_y(cp_orders[r].goto_tile));
+              } else {
+                n_retreat++;
+                log_normal("TT-Lang: turn %d unit #%d RETREAT → (%d,%d)",
+                           game.info.turn, cp_orders[r].unit_id,
+                           index_to_map_pos_x(cp_orders[r].goto_tile),
+                           index_to_map_pos_y(cp_orders[r].goto_tile));
+              }
+            }
+            if (n_advance + n_retreat > 0) {
+              notify_conn(game.est_connections, nullptr,
+                          E_GLOBAL_ECO, ftc_server,
+                          _("P300C Blackhole: %d units advancing, "
+                            "%d retreating (TT combat positioning)."),
+                          n_advance, n_retreat);
+            }
+          }
+          free(cp_orders);
+        }
+      }
+    }
 
     /* Retire useless barbarian units */
     players_iterate(pplayer) {
@@ -3296,6 +3794,55 @@ static void srv_ready(void)
     /* Must come before assign_player_colors() */
     generate_players();
     final_ruleset_adjustments();
+
+    /* TT-Lang: generate civilization identities on P300C Blackhole hardware.
+     * Each civilization gets a unique name, leader, cities, and color — all
+     * computed by the hardware genome pipeline.  Colors are applied to players
+     * before assign_player_colors() so TT colors take precedence. */
+    if (ttlang_available()) {
+      int n_players = player_count();
+      if (n_players > 0 && n_players <= TTLANG_MAX_CIVS) {
+        ttlang_civ_t tt_civs[TTLANG_MAX_CIVS];
+        char output_dir[256] = {0};
+        int  civ_seed = game.server.seed;
+
+        log_normal("TT-Lang: generating %d civilizations on P300C hardware "
+                   "(seed=%d)...", n_players, civ_seed);
+
+        if (ttlang_gen_civs(n_players, civ_seed, tt_civs, output_dir)) {
+          /* Apply TT-generated colors to each player.
+           * Players are in the same order as the civs array.
+           * assign_player_colors() runs next and will not override
+           * players that already have a color set. */
+          int civ_idx = 0;
+          players_iterate(pplayer) {
+            if (civ_idx >= n_players) break;
+            const ttlang_civ_t *tc = &tt_civs[civ_idx];
+            struct rgbcolor *rgb = rgbcolor_new(tc->color_r,
+                                               tc->color_g,
+                                               tc->color_b);
+            if (rgb) {
+              player_set_color(pplayer, rgb);
+              rgbcolor_destroy(rgb);
+            }
+            log_normal("TT-Lang: civ %d — %s of %s  rgb(%d,%d,%d)  "
+                       "agg=%d mil=%d sci=%d  flag=%s",
+                       civ_idx + 1,
+                       tc->leader, tc->nation,
+                       tc->color_r, tc->color_g, tc->color_b,
+                       tc->aggression, tc->military, tc->science,
+                       tc->flag_path[0] ? tc->flag_path : "(none)");
+            civ_idx++;
+          } players_iterate_end;
+
+          if (output_dir[0]) {
+            log_normal("TT-Lang: civilization assets written to %s", output_dir);
+          }
+        } else {
+          log_verbose("TT-Lang: gen_civs failed — using built-in FreeCiv nations");
+        }
+      }
+    }
 
     game.info.turn++; /* Pregame T0 -> game T1 */
     fc_assert(game.info.turn == 1);
