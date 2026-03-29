@@ -26,6 +26,11 @@
 
 #include "height_map.h"
 
+/* TT-Lang hardware integration */
+#include "ttlang_height.c"    /* static fallback data (256x256) */
+#include "ttlang_client.h"    /* live socket client */
+#define USE_TTLANG_TERRAIN 1
+
 int *height_map = nullptr;
 int hmap_shore_level = 0, hmap_mountain_level = 0;
 
@@ -100,6 +105,44 @@ void renormalize_hmap_poles(void)
 **************************************************************************/
 void make_random_hmap(int smooth)
 {
+#ifdef USE_TTLANG_TERRAIN
+  /* Attempt live hardware generation via the TT-Lang socket server.
+   * Falls back to the pre-baked static height map if the server is not
+   * running, so the game always works regardless. */
+  {
+    int map_w = wld.map.xsize;
+    int map_h = wld.map.ysize;
+    int map_tiles = map_w * map_h;
+
+    height_map = fc_malloc(sizeof(*height_map) * MAP_INDEX_SIZE);
+
+    if (ttlang_terrain_gen(height_map, map_w, map_h, game.server.seed)) {
+      /* Live hardware path */
+      log_normal("TT-Lang: generated %dx%d terrain on P300C hardware (seed %d)",
+                 map_w, map_h, game.server.seed);
+    } else {
+      /* Fallback: sample from static 256x256 pre-baked array */
+      int src_w = MAP_WIDTH;
+      int src_h = MAP_HEIGHT;
+      int idx;
+
+      log_verbose("TT-Lang: server unavailable, using pre-baked terrain (%dx%d → %dx%d)",
+                  src_w, src_h, map_w, map_h);
+
+      for (idx = 0; idx < map_tiles; idx++) {
+        int fc_col  = idx % map_w;
+        int fc_row  = idx / map_w;
+        int src_col = fc_col * src_w / map_w;
+        int src_row = fc_row * src_h / map_h;
+        height_map[idx] = ttlang_height_map[src_row * src_w + src_col];
+      }
+    }
+
+    adjust_int_map(height_map, 0, hmap_max_level);
+    return;
+  }
+#endif /* USE_TTLANG_TERRAIN */
+
   int i = 0;
   height_map = fc_malloc(sizeof(*height_map) * MAP_INDEX_SIZE);
 

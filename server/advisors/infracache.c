@@ -31,6 +31,9 @@
 
 #include "infracache.h"
 
+/* TT-Lang: per-turn tile score cache (updated by begin_turn scoring pass) */
+#include "generator/tt_tile_cache.h"
+
 /* Cache activities within the city map */
 struct worker_activity_cache {
   adv_want act[ACTIVITY_LAST];
@@ -322,6 +325,18 @@ adv_want city_tile_value(const struct city *pcity, const struct tile *ptile,
   value += trade * TRADE_WEIGHTING;
   if (trade > 0) {
     value += TRADE_WEIGHTING / 2;
+  }
+
+  /* TT-Lang: blend in TT-hardware-computed tile score from this turn's
+   * P300C Blackhole scoring pass.  The cache is populated in begin_turn()
+   * and gives the AI a hardware-derived bias toward land the TT kernel
+   * has scored highly (based on weighted food+shields+trade).
+   * TT_SCORE_WEIGHT=8 adds 0–800 to a tile's want value.  FOOD_WEIGHTING=30
+   * so a plain 3-food tile is worth ~105; TT can nudge this by up to 8×
+   * the raw tile score (typically 0–30 range), which is meaningful but
+   * does not override the basic land quality signal. */
+  if (tt_tile_cache_valid()) {
+    value += (adv_want)(tt_tile_cache_get(tile_index(ptile)) * TT_SCORE_WEIGHT);
   }
 
   return value;
