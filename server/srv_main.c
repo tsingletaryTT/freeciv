@@ -1253,8 +1253,17 @@ static void begin_turn(bool is_new_turn)
               /* Fertile grassland/forest: high food, not water */
               ok = !ocean && pt->output[O_FOOD] >= 2;
             } else if (strcmp(events[i].extra_name, "Fish") == 0) {
-              /* Water tiles only */
-              ok = ocean;
+              /* Coastal water only: ocean tile adjacent to at least one
+               * land tile.  Deep open-ocean tiles don't qualify — fish
+               * congregate near coasts and continental shelves. */
+              if (ocean) {
+                adjc_iterate(&(wld.map), ptile, padj) {
+                  if (!is_ocean_tile(padj)) {
+                    ok = true;
+                    break;
+                  }
+                } adjc_iterate_end;
+              }
             } else {
               /* Unknown resource type: land-only default */
               ok = !ocean;
